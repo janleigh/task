@@ -8,7 +8,8 @@ import time
 import argparse
 import readline
 from os import listdir
-from os.path import isfile, join
+from os.path import isfile, join, dirname, basename
+from datetime import date, timedelta
 from sys import stdout
 from sys import exit as byebye
 
@@ -36,21 +37,18 @@ args = parser.parse_args()
 
 # global variables for reuse
 if args.file:                                       # Enables user to select a
-    fileName = args.file + ".json"                  # different file to store
+    fileName = args.file + ".txt"                   # different file to store
 else:                                               # the tasks in
-    fileName = "tasks.json"
+    fileName = "tasks.txt"
 appName = "Task"                                    # Name of the application
 dirName = "hello-task"                              # Directory name
 homeDir = os.path.expanduser("~")                   # Use user's home as base
 targetDir = homeDir + "/.local/share/" + dirName    # Determine target directory
 targetFile = targetDir + "/" + fileName             # Construct full path
-data = {}                                           # JSON written to file
-data["tasks"] = []
-data["settings"] = []
+tasks = []                                          # Parsed todo.txt task list
+lvl = 4                                             # Foresight (view) level
 message = ""                                        # Feedback messages
-idCounter = 1                                       # Used to generate task id
 openTasks = 0                                       # Used to count open tasks
-unixDay = 86400                                     # Used to generate timestamp
 
 # set up classes for easier color coding
 class color:
@@ -74,18 +72,24 @@ class style:
     underline = "\033[4m"
     reverse = "\033[7m"
 
-# returns a list of available files
-def list():
-    return [f for f in listdir(targetDir) if isfile(join(targetDir, f))]
+# returns a list of available task files (todo.txt files only)
+def listFiles():
+    return [f for f in listdir(targetDir)
+            if isfile(join(targetDir, f)) and f.endswith(".txt")]
 
 # creates a strikethrough effect on fonts that support it
 def strike(text):
-    return "\u0336".join(text) + "\u0336"
+    return "̶".join(text) + "̶"
 
 
-# function is used by read and write functions
-def timeGrab():
-    return int(time.time())
+# today's date as an ISO string (todo.txt date format)
+def today():
+    return date.today().isoformat()
+
+
+# true if a token looks like a todo.txt date (YYYY-MM-DD)
+def isDate(token):
+    return re.match(r'^\d{4}-\d{2}-\d{2}$', token) is not None
 
 
 # clear screen buffer
@@ -132,8 +136,7 @@ def modeline(v):
                "enter Go Back | id Open File",
                "enter Go Back | name Create New File"]
     left = mode(v) + color.white + " " + actions[v] + " "
-    right = " #" + str(openTasks) + " ~" +\
-            str(data["settings"][0]["lvl"]) + " " + message
+    right = " #" + str(openTasks) + " ~" + str(lvl) + " " + message
     # calculate padding and account for escape sequence color codes
     padding = int(size[1]) - len(left) - len(right) + escLength
     output = left + " " * padding + right
@@ -146,7 +149,7 @@ def modeline(v):
 
 # render filename above task list
 def fileline():
-    if len(list()) > 1:
+    if len(listFiles()) > 1:
         indicator = " [+]"
     else:
         indicator = ""
@@ -155,175 +158,253 @@ def fileline():
     print(color.white + style.reverse + " " + fileName + indicator + " " * (padding - 1) + color.reset + "\n")
 
 
-# check if JSON exists, execute creation if not
-def jsonCheck(file):
+# path of the sidecar that stores per-file view settings (foresight level).
+# kept separate so the todo.txt file itself stays a pure list of tasks.
+def confPath(path):
+    return join(dirname(path), "." + basename(path) + ".conf")
+
+
+# read the foresight level for the current file, defaulting to 4
+def loadLvl():
     try:
-        f = open(file)
+        with open(confPath(targetFile)) as conf:
+            value = int(conf.read().strip())
+            return value if value in range(1, 5) else 4
+    except BaseException:
+        return 4
+
+
+# persist the foresight level for the current file
+def saveLvl(value):
+    with open(confPath(targetFile), "w") as conf:
+        conf.write(str(value))
+
+
+# parse a single todo.txt line into a task dict
+def lineToTask(line):
+    t = {"done": False, "completed": None, "priority": None,
+         "created": None, "due": None, "task": ""}
+    tokens = line.split(" ")
+    i = 0
+    # completion marker and optional completion date
+    if i < len(tokens) and tokens[i] == "x":
+        t["done"] = True
+        i += 1
+        if i < len(tokens) and isDate(tokens[i]):
+            t["completed"] = tokens[i]
+            i += 1
+    # priority, e.g. (A)
+    if i < len(tokens) and re.match(r'^\([A-Z]\)$', tokens[i]):
+        t["priority"] = tokens[i][1]
+        i += 1
+    # creation date
+    if i < len(tokens) and isDate(tokens[i]):
+        t["created"] = tokens[i]
+        i += 1
+    # the rest is the description, with the due: tag pulled out as metadata
+    description = []
+    for token in tokens[i:]:
+        due = re.match(r'^due:(\d{4}-\d{2}-\d{2})$', token)
+        if due:
+            t["due"] = due.group(1)
+        else:
+            description.append(token)
+    t["task"] = " ".join(description)
+    return t
+
+
+# serialize a task dict back into a todo.txt line
+def taskToLine(t):
+    parts = []
+    if t["done"]:
+        parts.append("x")
+        if t["completed"]:
+            parts.append(t["completed"])
+    elif t["priority"]:
+        parts.append("(" + t["priority"] + ")")
+    if t["created"]:
+        parts.append(t["created"])
+    if t["task"]:
+        parts.append(t["task"])
+    if t["due"]:
+        parts.append("due:" + t["due"])
+    return " ".join(parts)
+
+
+# read a todo.txt file into a list of task dicts, ids follow line order
+def readTasks(path):
+    parsed = []
+    with open(path) as todofile:
+        for line in todofile:
+            line = line.rstrip("\n")
+            if line.strip() == "":
+                continue
+            parsed.append(lineToTask(line))
+    for index, t in enumerate(parsed):
+        t["id"] = index + 1
+    return parsed
+
+
+# write the in-memory task list back out as todo.txt
+def writeTasks(path):
+    with open(path, "w") as todofile:
+        for t in tasks:
+            todofile.write(taskToLine(t) + "\n")
+
+
+# one-shot migration of a legacy json file into todo.txt format
+def jsonMigrate(jsonPath, txtPath):
+    global tasks
+    with open(jsonPath) as legacy:
+        old = json.load(legacy)
+    migrated = []
+    for o in old.get("tasks", []):
+        t = {"done": str(o.get("done")) == "true", "completed": None,
+             "priority": None, "created": None, "due": None,
+             "task": str(o.get("task", ""))}
+        # the old format stored the due date as a unix timestamp
+        if "due" in o:
+            try:
+                t["due"] = date.fromtimestamp(int(o["due"])).isoformat()
+            except BaseException:
+                t["due"] = None
+        migrated.append(t)
+    tasks = migrated
+    writeTasks(txtPath)
+    # carry the foresight level over into the new sidecar
+    try:
+        legacyLvl = int(old["settings"][0]["lvl"])
+    except BaseException:
+        legacyLvl = 4
+    saveLvl(legacyLvl if legacyLvl in range(1, 5) else 4)
+
+
+# check if the task file exists, execute creation if not
+def fileCheck(path):
+    if isfile(path):
         updateMsg("File loaded", 4)
-        taskList(file)
-    except:
-        jsonCreate()
+        taskList(path)
+    else:
+        # if no todo.txt exists yet but a legacy json file does, migrate it once.
+        # the original json is left in place untouched as a backup.
+        legacy = path[:-4] + ".json" if path.endswith(".txt") else path + ".json"
+        if isfile(legacy):
+            jsonMigrate(legacy, path)
+            updateMsg("Migrated tasks from json", 4)
+            taskList(path)
+        else:
+            fileCreate(path)
 
 
-# create JSON file and directory
-def jsonCreate():
+# create an empty todo.txt file and directory
+def fileCreate(path):
     if not os.path.exists(targetDir):
         os.mkdir(targetDir, 0o755)
-    data["settings"].append({
-        "idCounter": idCounter,
-        "lvl": 4
-    })
-    with open(targetFile, "w") as taskfile:
-        json.dump(data, taskfile)
+    open(path, "w").close()
+    saveLvl(4)
     updateMsg("New file storage created", 4)
-    taskList(targetFile)
+    taskList(path)
 
 
-# write new content to JSON file
-def jsonWrite(n):
-    global data
-    global idCounter
-    # it's important to 'try' otherwise entries that don't end in
-    # the search string will cause massive errors
-    try:
-        context = re.findall(r'\B@\w+', n)
-    except:
-        context = ""
-    try:
-        project = re.findall(r'\B\+\w+', n)
-    except:
-        project = ""
-    try:
-        dueTime = re.search(r'(in\s+(\d+?)\s+day(s\b|\b))$', n, re.M|re.I)
-        dueTemp = re.search(r'(\d+)', dueTime.group(), re.M|re.I)
-        task = n[:-(len(dueTime.group())+1)]
-        data["tasks"].append({
-            "id": idCounter,
-            "task": task,
-            # we need to reduce the due time by one second to prevent
-            # the timer showing a wrong due date right after creation
-            "due": timeGrab()+(int(dueTemp.group())*unixDay-1),
-            "done": "false",
-            "context": context,
-            "project": project
-        })
-    # if there's no due date supplied, write the task to json without
-    # the due key/value pair
-    except:
-        data["tasks"].append({
-            "id": idCounter,
-            "task": n,
-            "done": "false",
-            "context": context,
-            "project": project
-        })
-    idCounter += 1
-    data["settings"][0]["idCounter"] = idCounter
+# add a new task to the todo.txt file
+def addTask(n):
+    global tasks
+    t = {"done": False, "completed": None, "priority": None,
+         "created": today(), "due": None, "task": n}
+    # if a natural 'in X days' suffix is present, convert it to a due: tag
+    # and strip it from the description
+    dueTime = re.search(r'(in\s+(\d+?)\s+day(s\b|\b))$', n, re.M | re.I)
+    if dueTime:
+        dueDays = int(re.search(r'(\d+)', dueTime.group(), re.M | re.I).group())
+        t["task"] = n[:-(len(dueTime.group()) + 1)]
+        t["due"] = (date.today() + timedelta(days=dueDays)).isoformat()
+    tasks.append(t)
     updateMsg("New task added", 3)
-    with open(targetFile, "w") as outfile:
-        json.dump(data, outfile)
+    writeTasks(targetFile)
     taskList(targetFile)
 
 
-# remove item from JSON file
-def jsonRemove(n):
-    global idCounter
-    massRemove = []
-    # if jsonRemove was called without any parameters
+# remove items from the todo.txt file
+def removeTask(n):
+    global tasks
+    # if removeTask was called without any parameters, purge all done tasks
     if len(n.split()) == 0:
-        for i in range(len(data["tasks"])):
-            if data["tasks"][i]["done"] == "true":
-                massRemove.append(data["tasks"][i]["id"])
+        targets = [t["id"] for t in tasks if t["done"]]
     # otherwise move through the passed parameters
     else:
-        massRemove = n.split()
-    for j in range(len(massRemove)):
+        targets = n.split()
+    for token in targets:
         try:
-            check = int(massRemove[j])
-            for i in range(len(data["tasks"])):
-                if data["tasks"][i]["id"] == check:
-                    if data["tasks"][i]["done"] == "false":
-                        updateMsg("Unable to remove unfinished tasks", 0)
-                        break
-                    else:
-                        data["tasks"].pop(i)
-                        # clean up idCounter to next lowest free id
-                        if len(data["tasks"]) >= 1:
-                            data["settings"][0]["idCounter"] = data["tasks"][-1]["id"]+1
-                            idCounter = data["tasks"][-1]["id"]+1
-                        else:
-                            data["settings"][0]["idCounter"] = 1
-                            idCounter = 1
-                        with open(targetFile, "w") as outfile:
-                            json.dump(data, outfile)
-                        break
-                else:
-                    updateMsg("Unable to find task id " + str(check), 0)
+            check = int(token)
         except ValueError:
             updateMsg("Please use the id of the task", 0)
+            continue
+        match = next((t for t in tasks if t["id"] == check), None)
+        if match is None:
+            updateMsg("Unable to find task id " + str(check), 0)
+        elif not match["done"]:
+            updateMsg("Unable to remove unfinished tasks", 0)
+        else:
+            tasks.remove(match)
+    writeTasks(targetFile)
     updateMsg("Removed task", 2)
     taskList(targetFile)
 
 
 # toggle item's done state instead of directly removing it
 def doneToggle(n):
+    global tasks
     global openTasks
-    massToggle = n.split()
-    for j in range(len(massToggle)):
+    for token in n.split():
         try:
-            check = int(massToggle[j])
-            for i in range(len(data["tasks"])):
-                if data["tasks"][i]["id"] == check:
-                    if data["tasks"][i]["done"] == "false":
-                        data["tasks"][i]["done"] = "true"
-                        if openTasks > 0:
-                            openTasks = openTasks - 1
-                        updateMsg("Marked task as done", 4)
-                    else:
-                        data["tasks"][i]["done"] = "false"
-                        openTasks = openTasks + 1
-                        updateMsg("Marked task as not done", 4)
-                    with open(targetFile, "w") as outfile:
-                        json.dump(data, outfile)
-                    break
-                else:
-                    updateMsg("Unable to find task id " + str(check), 0)
+            check = int(token)
         except ValueError:
             updateMsg("Please use the id of the task", 0)
+            continue
+        match = next((t for t in tasks if t["id"] == check), None)
+        if match is None:
+            updateMsg("Unable to find task id " + str(check), 0)
+        elif not match["done"]:
+            match["done"] = True
+            match["completed"] = today()
+            if openTasks > 0:
+                openTasks = openTasks - 1
+            updateMsg("Marked task as done", 4)
+        else:
+            match["done"] = False
+            match["completed"] = None
+            openTasks = openTasks + 1
+            updateMsg("Marked task as not done", 4)
+    writeTasks(targetFile)
     taskList(targetFile)
 
 
-# read JSON file into memory and print to stdout as sorted groups
-def jsonRead(content):
-    global data
-    global idCounter
+# read todo.txt file into memory and print to stdout as sorted groups
+def renderTasks(content):
+    global tasks
+    global lvl
     global openTasks
     group = {}
     gkey = ""
     gval = ""
     glvl = 0
     task = 0
-    with open(content) as objects:
-        data = json.load(objects)
-    if data["settings"][0]["idCounter"] > 1:
-        idCounter = data["settings"][0]["idCounter"]
-    else:
-        idCounter = 1
+    tasks = readTasks(content)
+    lvl = loadLvl()
     # let's get things sorted
-    for o in data["tasks"]:
-        # try if it's possible to grab the due value and assign o to a group
-        try:
-            days = int(o["due"]) - timeGrab()
-            days = days/24/60/60+1
+    for o in tasks:
+        # if a due date exists, assign o to a group based on how far away it is
+        if o["due"]:
+            days = (date.fromisoformat(o["due"]) - date.today()).days
             if days < 0:
                 gkey = 2
                 gval = style.bold + color.red + "Overdue"
                 glvl = 3
-            elif days < 1:
+            elif days == 0:
                 gkey = 3
                 gval = color.red + "Today"
                 glvl = 1
-            elif days < 2:
+            elif days == 1:
                 gkey = 4
                 gval = color.yellow + "Tomorrow"
                 glvl = 1
@@ -331,12 +412,11 @@ def jsonRead(content):
                 gkey = int(days + 4)
                 gval = "In " + str(int(days)) + " days"
                 glvl = 4
-        # if there's no timestamp to use, put o into the "whenever" group
-        except BaseException:
+        # if there's no due date, put o into the "whenever" group
+        else:
             gkey = 1
             gval = color.white + "Unscheduled"
             glvl = 2
-            pass
         # create groups dynamically based on the existence of keys
         if gkey not in group:
             group[gkey] = [{
@@ -345,7 +425,7 @@ def jsonRead(content):
                 "item": []
                 }]
         # add tasks to their group keys
-        if str(o["done"]) == "false":
+        if not o["done"]:
             taskDescription = str(o["task"])
             doneState = '   '
             task = task + 1
@@ -366,7 +446,7 @@ def jsonRead(content):
         for (sortKey, dueGroups) in sorted(group.items()):
             for dueGroup in dueGroups:
                 # print only the dueGroup that matches current view level settings
-                if dueGroup["lvl"] <= data["settings"][0]["lvl"]:
+                if dueGroup["lvl"] <= lvl:
                     printCounter = printCounter + 1
                     print("   " + dueGroup["due"] + color.reset + "\n")
                     for task in dueGroup["item"]:
@@ -377,11 +457,11 @@ def jsonRead(content):
             moji("hidden")
 
 
-# display JSON content as task list
+# display todo.txt content as task list
 def taskList(tasks):
     clearScreen()
     fileline()
-    jsonRead(tasks)
+    renderTasks(tasks)
     stdout.write("\x1b]2;" + appName + "\x07")
     modeline(0)
     userInput()
@@ -400,7 +480,7 @@ def userInput():
     elif choice.startswith(":f"):
         foresight(choice[2:].strip())
     elif choice.startswith(":p"):
-        jsonRemove(choice[2:].strip())
+        removeTask(choice[2:].strip())
     elif choice.startswith(":o"):
         fileswitcher()
     elif choice.startswith(":n"):
@@ -415,23 +495,21 @@ def userInput():
         updateMsg("Not sure what to do", 1)
         taskList(targetFile)
     else:
-        jsonWrite(choice)
+        addTask(choice)
 
 
 # update foresight
 def foresight(n):
-    global data
-    global idCounter
+    global lvl
     try:
-        lvl = int(n)
-        if int(lvl) in range(1, 5):
-            data["settings"][0]["lvl"] = int(lvl)
-            updateMsg("Foresight set to " + str(lvl), 4)
+        value = int(n)
+        if value in range(1, 5):
+            lvl = value
+            saveLvl(value)
+            updateMsg("Foresight set to " + str(value), 4)
         else:
-            raise
-        with open(targetFile, "w") as outfile:
-            json.dump(data, outfile)
-    except:
+            raise ValueError
+    except BaseException:
         clearScreen()
         fileline()
         print("""   Change amount of tasks to display
@@ -446,7 +524,7 @@ def foresight(n):
         try:
             select = int(foresightSelect)
             foresight(select)
-        except:
+        except BaseException:
             updateMsg("Please select a value between 1-4", 0)
     taskList(targetFile)
 
@@ -459,7 +537,7 @@ def fileswitcher():
     fileline()
     print("   Open available file\n")
     i = 0
-    fileList = [f for f in listdir(targetDir) if isfile(join(targetDir, f))]
+    fileList = listFiles()
     for singleFile in fileList:
         i = i + 1
         idSpacing = (5 - len(str(i))) * " "
@@ -495,7 +573,7 @@ def fileRemover():
     fileline()
     print("   Select a file for removal\n")
     i = 0
-    deletionList = [f for f in listdir(targetDir) if isfile(join(targetDir, f))]
+    deletionList = listFiles()
     if fileName in deletionList:
         deletionList.remove(fileName)
     for singleFile in deletionList:
@@ -510,6 +588,9 @@ def fileRemover():
             deletionPath = targetDir + "/" + deletionList[int(deleteFile) -1]
             try:
                 os.remove(deletionPath)
+                # clean up the per-file settings sidecar as well
+                if isfile(confPath(deletionPath)):
+                    os.remove(confPath(deletionPath))
                 updateMsg("File deleted", 2)
                 taskList(targetFile)
             except:
@@ -527,8 +608,8 @@ def fileRemover():
 def newfile(file):
     global targetFile
     global fileName
-    global data
-    global idCounter
+    global tasks
+    global lvl
     clearScreen()
     fileline()
     if len(file) < 1:
@@ -536,24 +617,20 @@ def newfile(file):
         modeline(5)
         newFile = input(" > ").strip().split()[0]
         if len(newFile) > 0:
-            data = {}
-            data["tasks"] = []
-            data["settings"] = []
-            idCounter = 1
-            fileName = newFile + ".json"
+            tasks = []
+            lvl = 4
+            fileName = newFile + ".txt"
             targetFile = targetDir + "/" + fileName
-            jsonCheck(targetFile)
+            fileCheck(targetFile)
         else:
             updateMsg("Please specify a filename", 0)
             taskList(targetFile)
     elif len(file) >= 1:
-        data = {}
-        data["tasks"] = []
-        data["settings"] = []
-        idCounter = 1
-        fileName = file.strip().split(" ")[0] + ".json"
+        tasks = []
+        lvl = 4
+        fileName = file.strip().split(" ")[0] + ".txt"
         targetFile = targetDir + "/" + fileName
-        jsonCheck(targetFile)
+        fileCheck(targetFile)
 
 
 # short help print
@@ -596,4 +673,4 @@ def moji(mode):
 
 # execute program only if not imported as module
 if __name__ == "__main__":
-    jsonCheck(targetFile)
+    fileCheck(targetFile)
