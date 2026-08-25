@@ -7,6 +7,7 @@ import json
 import time
 import argparse
 import readline
+from abc import ABC, abstractmethod
 from os import listdir
 from os.path import isfile, join, dirname, basename
 from datetime import date, timedelta
@@ -45,7 +46,6 @@ dirName = "hello-task"                              # Directory name
 homeDir = os.path.expanduser("~")                   # Use user's home as base
 targetDir = homeDir + "/.local/share/" + dirName    # Determine target directory
 targetFile = targetDir + "/" + fileName             # Construct full path
-tasks = []                                          # Parsed todo.txt task list
 lvl = 4                                             # Foresight (view) level
 message = ""                                        # Feedback messages
 openTasks = 0                                       # Used to count open tasks
@@ -72,24 +72,340 @@ class style:
     underline = "\033[4m"
     reverse = "\033[7m"
 
-# returns a list of available task files (todo.txt files only)
-def listFiles():
-    return [f for f in listdir(targetDir)
-            if isfile(join(targetDir, f)) and f.endswith(".txt")]
+
+# ---------------------------------------------------------------------------
+# Bridge Pattern: Implementation interface
+# ---------------------------------------------------------------------------
+
+class StorageBackend(ABC):
+    """Abstract interface for task persistence (the 'Implementation' in the
+    Bridge pattern).  Concrete backends handle low-level file I/O while the
+    TaskManager abstraction delegates all storage work here."""
+
+    @abstractmethod
+    def load(self, path):
+        """Read tasks from *path* and return a list of task dicts."""
+
+    @abstractmethod
+    def save(self, path, tasks):
+        """Persist a list of task dicts to *path* (crash-safe)."""
+
+    @abstractmethod
+    def create(self, path):
+        """Create a new, empty task file (and parent directories)."""
+
+    @abstractmethod
+    def delete(self, path):
+        """Delete the task file at *path* and its sidecar config."""
+
+    @abstractmethod
+    def list_files(self):
+        """Return a list of available task file names."""
+
+    @abstractmethod
+    def file_exists(self, path):
+        """Return True if the task file at *path* exists."""
+
+    @abstractmethod
+    def load_lvl(self, path):
+        """Read the foresight level for *path*, defaulting to 4."""
+
+    @abstractmethod
+    def save_lvl(self, path, value):
+        """Persist the foresight level for *path*."""
+
+    @abstractmethod
+    def migrate_json(self, json_path, txt_path):
+        """One-shot migration of a legacy json file into the native format."""
+
+
+# ---------------------------------------------------------------------------
+# Bridge Pattern: Concrete Implementation — todo.txt backend
+# ---------------------------------------------------------------------------
+
+class TodoTxtBackend(StorageBackend):
+    """Concrete storage backend that persists tasks as todo.txt files.
+    Writes are crash-safe: data is flushed to a temporary file first, then
+    atomically moved into place via os.replace()."""
+
+    def __init__(self, target_dir):
+        self._target_dir = target_dir
+
+    # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _is_date(token):
+        """True if a token looks like a todo.txt date (YYYY-MM-DD)."""
+        return re.match(r'^\d{4}-\d{2}-\d{2}$', token) is not None
+
+    @staticmethod
+    def _conf_path(path):
+        """Path of the sidecar that stores per-file view settings (foresight
+        level).  Kept separate so the todo.txt file itself stays a pure list
+        of tasks."""
+        return join(dirname(path), "." + basename(path) + ".conf")
+
+    @staticmethod
+    def _line_to_task(line):
+        """Parse a single todo.txt line into a task dict."""
+        t = {"done": False, "completed": None, "priority": None,
+             "created": None, "due": None, "task": ""}
+        tokens = line.split(" ")
+        i = 0
+        # completion marker and optional completion date
+        if i < len(tokens) and tokens[i] == "x":
+            t["done"] = True
+            i += 1
+            if i < len(tokens) and TodoTxtBackend._is_date(tokens[i]):
+                t["completed"] = tokens[i]
+                i += 1
+        # priority, e.g. (A)
+        if i < len(tokens) and re.match(r'^\([A-Z]\)$', tokens[i]):
+            t["priority"] = tokens[i][1]
+            i += 1
+        # creation date
+        if i < len(tokens) and TodoTxtBackend._is_date(tokens[i]):
+            t["created"] = tokens[i]
+            i += 1
+        # the rest is the description, with the due: tag pulled out as metadata
+        description = []
+        for token in tokens[i:]:
+            due = re.match(r'^due:(\d{4}-\d{2}-\d{2})$', token)
+            if due:
+                t["due"] = due.group(1)
+            else:
+                description.append(token)
+        t["task"] = " ".join(description)
+        return t
+
+    @staticmethod
+    def _task_to_line(t):
+        """Serialize a task dict back into a todo.txt line."""
+        parts = []
+        if t["done"]:
+            parts.append("x")
+            if t["completed"]:
+                parts.append(t["completed"])
+        elif t["priority"]:
+            parts.append("(" + t["priority"] + ")")
+        if t["created"]:
+            parts.append(t["created"])
+        if t["task"]:
+            parts.append(t["task"])
+        if t["due"]:
+            parts.append("due:" + t["due"])
+        return " ".join(parts)
+
+    # -- interface ---------------------------------------------------------
+
+    def load(self, path):
+        """Read a todo.txt file into a list of task dicts.  IDs are assigned
+        as the smallest available positive integers so that gaps left by
+        deleted tasks are reused, keeping ID numbers low."""
+        parsed = []
+        with open(path) as todofile:
+            for line in todofile:
+                line = line.rstrip("\n")
+                if line.strip() == "":
+                    continue
+                parsed.append(self._line_to_task(line))
+        # assign the smallest available positive integer IDs
+        used = set()
+        for t in parsed:
+            next_id = 1
+            while next_id in used:
+                next_id += 1
+            t["id"] = next_id
+            used.add(next_id)
+        return parsed
+
+    def save(self, path, tasks):
+        """Write the in-memory task list to a todo.txt file.  Uses a
+        temporary file + os.replace() so that a crash during the write can
+        never leave the original file truncated or empty."""
+        tmp = path + ".tmp"
+        with open(tmp, "w") as todofile:
+            for t in tasks:
+                todofile.write(self._task_to_line(t) + "\n")
+            todofile.flush()
+            os.fsync(todofile.fileno())
+        os.replace(tmp, path)
+
+    def create(self, path):
+        """Create an empty todo.txt file and its parent directory."""
+        if not os.path.exists(self._target_dir):
+            os.mkdir(self._target_dir, 0o755)
+        open(path, "w").close()
+        self.save_lvl(path, 4)
+
+    def delete(self, path):
+        """Delete a todo.txt file and its per-file settings sidecar."""
+        os.remove(path)
+        conf = self._conf_path(path)
+        if isfile(conf):
+            os.remove(conf)
+
+    def list_files(self):
+        """Return a list of available task files (todo.txt files only)."""
+        return [f for f in listdir(self._target_dir)
+                if isfile(join(self._target_dir, f)) and f.endswith(".txt")]
+
+    def file_exists(self, path):
+        """Return True if the task file at *path* exists."""
+        return isfile(path)
+
+    def load_lvl(self, path):
+        """Read the foresight level for the current file, defaulting to 4."""
+        try:
+            with open(self._conf_path(path)) as conf:
+                value = int(conf.read().strip())
+                return value if value in range(1, 5) else 4
+        except BaseException:
+            return 4
+
+    def save_lvl(self, path, value):
+        """Persist the foresight level for the current file."""
+        with open(self._conf_path(path), "w") as conf:
+            conf.write(str(value))
+
+    def migrate_json(self, json_path, txt_path):
+        """One-shot migration of a legacy json file into todo.txt format."""
+        with open(json_path) as legacy:
+            old = json.load(legacy)
+        migrated = []
+        for o in old.get("tasks", []):
+            t = {"done": str(o.get("done")) == "true", "completed": None,
+                 "priority": None, "created": None, "due": None,
+                 "task": str(o.get("task", ""))}
+            # the old format stored the due date as a unix timestamp
+            if "due" in o:
+                try:
+                    t["due"] = date.fromtimestamp(int(o["due"])).isoformat()
+                except BaseException:
+                    t["due"] = None
+            migrated.append(t)
+        self.save(txt_path, migrated)
+        # carry the foresight level over into the new sidecar
+        try:
+            legacy_lvl = int(old["settings"][0]["lvl"])
+        except BaseException:
+            legacy_lvl = 4
+        self.save_lvl(txt_path, legacy_lvl if legacy_lvl in range(1, 5) else 4)
+        return migrated
+
+
+# ---------------------------------------------------------------------------
+# Bridge Pattern: Abstraction — task manager
+# ---------------------------------------------------------------------------
+
+class TaskManager:
+    """High-level task operations (the 'Abstraction' in the Bridge pattern).
+    Delegates all persistence work to a StorageBackend implementation via the
+    bridge reference self.backend."""
+
+    def __init__(self, backend):
+        self.backend = backend
+        self.tasks = []
+
+    def load(self, path):
+        """Load tasks from the backend."""
+        self.tasks = self.backend.load(path)
+        return self.tasks
+
+    def save(self, path):
+        """Persist the current task list via the backend."""
+        self.backend.save(path, self.tasks)
+
+    def add_task(self, text, path):
+        """Add a new task with optional natural 'in X days' due date."""
+        t = {"done": False, "completed": None, "priority": None,
+             "created": today(), "due": None, "task": text}
+        # if a natural 'in X days' suffix is present, convert it to a due: tag
+        # and strip it from the description
+        dueTime = re.search(r'(in\s+(\d+?)\s+day(s\b|\b))$', text, re.M | re.I)
+        if dueTime:
+            dueDays = int(re.search(r'(\d+)', dueTime.group(), re.M | re.I).group())
+            t["task"] = text[:-(len(dueTime.group()) + 1)]
+            t["due"] = (date.today() + timedelta(days=dueDays)).isoformat()
+        self.tasks.append(t)
+        # assign the smallest available ID to the new task
+        used = {task["id"] for task in self.tasks if "id" in task}
+        next_id = 1
+        while next_id in used:
+            next_id += 1
+        t["id"] = next_id
+        self.save(path)
+
+    def remove_task(self, n, path):
+        """Remove items from the task list.  If called without parameters,
+        purge all done tasks."""
+        # if removeTask was called without any parameters, purge all done tasks
+        if len(n.split()) == 0:
+            targets = [t["id"] for t in self.tasks if t["done"]]
+        # otherwise move through the passed parameters
+        else:
+            targets = n.split()
+        for token in targets:
+            try:
+                check = int(token)
+            except ValueError:
+                updateMsg("Please use the id of the task", 0)
+                continue
+            match = next((t for t in self.tasks if t["id"] == check), None)
+            if match is None:
+                updateMsg("Unable to find task id " + str(check), 0)
+            elif not match["done"]:
+                updateMsg("Unable to remove unfinished tasks", 0)
+            else:
+                self.tasks.remove(match)
+        self.save(path)
+
+    def done_toggle(self, n, path):
+        """Toggle item's done state instead of directly removing it."""
+        global openTasks
+        for token in n.split():
+            try:
+                check = int(token)
+            except ValueError:
+                updateMsg("Please use the id of the task", 0)
+                continue
+            match = next((t for t in self.tasks if t["id"] == check), None)
+            if match is None:
+                updateMsg("Unable to find task id " + str(check), 0)
+            elif not match["done"]:
+                match["done"] = True
+                match["completed"] = today()
+                if openTasks > 0:
+                    openTasks = openTasks - 1
+                updateMsg("Marked task as done", 4)
+            else:
+                match["done"] = False
+                match["completed"] = None
+                openTasks = openTasks + 1
+                updateMsg("Marked task as not done", 4)
+        self.save(path)
+
+
+# ---------------------------------------------------------------------------
+# Instantiate the bridge: concrete backend + task manager
+# ---------------------------------------------------------------------------
+
+backend = TodoTxtBackend(targetDir)
+manager = TaskManager(backend)
+
+
+# ---------------------------------------------------------------------------
+# UI helpers (unchanged from original, except using manager/backend)
+# ---------------------------------------------------------------------------
 
 # creates a strikethrough effect on fonts that support it
 def strike(text):
-    return "̶".join(text) + "̶"
+    return '\u0336'.join(text) + '\u0336'
 
 
 # today's date as an ISO string (todo.txt date format)
 def today():
     return date.today().isoformat()
-
-
-# true if a token looks like a todo.txt date (YYYY-MM-DD)
-def isDate(token):
-    return re.match(r'^\d{4}-\d{2}-\d{2}$', token) is not None
 
 
 # clear screen buffer
@@ -149,7 +465,7 @@ def modeline(v):
 
 # render filename above task list
 def fileline():
-    if len(listFiles()) > 1:
+    if len(backend.list_files()) > 1:
         indicator = " [+]"
     else:
         indicator = ""
@@ -158,138 +474,21 @@ def fileline():
     print(color.white + style.reverse + " " + fileName + indicator + " " * (padding - 1) + color.reset + "\n")
 
 
-# path of the sidecar that stores per-file view settings (foresight level).
-# kept separate so the todo.txt file itself stays a pure list of tasks.
-def confPath(path):
-    return join(dirname(path), "." + basename(path) + ".conf")
-
-
-# read the foresight level for the current file, defaulting to 4
-def loadLvl():
-    try:
-        with open(confPath(targetFile)) as conf:
-            value = int(conf.read().strip())
-            return value if value in range(1, 5) else 4
-    except BaseException:
-        return 4
-
-
-# persist the foresight level for the current file
-def saveLvl(value):
-    with open(confPath(targetFile), "w") as conf:
-        conf.write(str(value))
-
-
-# parse a single todo.txt line into a task dict
-def lineToTask(line):
-    t = {"done": False, "completed": None, "priority": None,
-         "created": None, "due": None, "task": ""}
-    tokens = line.split(" ")
-    i = 0
-    # completion marker and optional completion date
-    if i < len(tokens) and tokens[i] == "x":
-        t["done"] = True
-        i += 1
-        if i < len(tokens) and isDate(tokens[i]):
-            t["completed"] = tokens[i]
-            i += 1
-    # priority, e.g. (A)
-    if i < len(tokens) and re.match(r'^\([A-Z]\)$', tokens[i]):
-        t["priority"] = tokens[i][1]
-        i += 1
-    # creation date
-    if i < len(tokens) and isDate(tokens[i]):
-        t["created"] = tokens[i]
-        i += 1
-    # the rest is the description, with the due: tag pulled out as metadata
-    description = []
-    for token in tokens[i:]:
-        due = re.match(r'^due:(\d{4}-\d{2}-\d{2})$', token)
-        if due:
-            t["due"] = due.group(1)
-        else:
-            description.append(token)
-    t["task"] = " ".join(description)
-    return t
-
-
-# serialize a task dict back into a todo.txt line
-def taskToLine(t):
-    parts = []
-    if t["done"]:
-        parts.append("x")
-        if t["completed"]:
-            parts.append(t["completed"])
-    elif t["priority"]:
-        parts.append("(" + t["priority"] + ")")
-    if t["created"]:
-        parts.append(t["created"])
-    if t["task"]:
-        parts.append(t["task"])
-    if t["due"]:
-        parts.append("due:" + t["due"])
-    return " ".join(parts)
-
-
-# read a todo.txt file into a list of task dicts, ids follow line order
-def readTasks(path):
-    parsed = []
-    with open(path) as todofile:
-        for line in todofile:
-            line = line.rstrip("\n")
-            if line.strip() == "":
-                continue
-            parsed.append(lineToTask(line))
-    for index, t in enumerate(parsed):
-        t["id"] = index + 1
-    return parsed
-
-
-# write the in-memory task list back out as todo.txt
-def writeTasks(path):
-    with open(path, "w") as todofile:
-        for t in tasks:
-            todofile.write(taskToLine(t) + "\n")
-
-
-# one-shot migration of a legacy json file into todo.txt format
-def jsonMigrate(jsonPath, txtPath):
-    global tasks
-    with open(jsonPath) as legacy:
-        old = json.load(legacy)
-    migrated = []
-    for o in old.get("tasks", []):
-        t = {"done": str(o.get("done")) == "true", "completed": None,
-             "priority": None, "created": None, "due": None,
-             "task": str(o.get("task", ""))}
-        # the old format stored the due date as a unix timestamp
-        if "due" in o:
-            try:
-                t["due"] = date.fromtimestamp(int(o["due"])).isoformat()
-            except BaseException:
-                t["due"] = None
-        migrated.append(t)
-    tasks = migrated
-    writeTasks(txtPath)
-    # carry the foresight level over into the new sidecar
-    try:
-        legacyLvl = int(old["settings"][0]["lvl"])
-    except BaseException:
-        legacyLvl = 4
-    saveLvl(legacyLvl if legacyLvl in range(1, 5) else 4)
-
+# ---------------------------------------------------------------------------
+# Core application routines (using manager/backend bridge)
+# ---------------------------------------------------------------------------
 
 # check if the task file exists, execute creation if not
 def fileCheck(path):
-    if isfile(path):
+    if backend.file_exists(path):
         updateMsg("File loaded", 4)
         taskList(path)
     else:
         # if no todo.txt exists yet but a legacy json file does, migrate it once.
         # the original json is left in place untouched as a backup.
         legacy = path[:-4] + ".json" if path.endswith(".txt") else path + ".json"
-        if isfile(legacy):
-            jsonMigrate(legacy, path)
+        if backend.file_exists(legacy):
+            manager.tasks = backend.migrate_json(legacy, path)
             updateMsg("Migrated tasks from json", 4)
             taskList(path)
         else:
@@ -298,90 +497,33 @@ def fileCheck(path):
 
 # create an empty todo.txt file and directory
 def fileCreate(path):
-    if not os.path.exists(targetDir):
-        os.mkdir(targetDir, 0o755)
-    open(path, "w").close()
-    saveLvl(4)
+    backend.create(path)
     updateMsg("New file storage created", 4)
     taskList(path)
 
 
 # add a new task to the todo.txt file
 def addTask(n):
-    global tasks
-    t = {"done": False, "completed": None, "priority": None,
-         "created": today(), "due": None, "task": n}
-    # if a natural 'in X days' suffix is present, convert it to a due: tag
-    # and strip it from the description
-    dueTime = re.search(r'(in\s+(\d+?)\s+day(s\b|\b))$', n, re.M | re.I)
-    if dueTime:
-        dueDays = int(re.search(r'(\d+)', dueTime.group(), re.M | re.I).group())
-        t["task"] = n[:-(len(dueTime.group()) + 1)]
-        t["due"] = (date.today() + timedelta(days=dueDays)).isoformat()
-    tasks.append(t)
+    manager.add_task(n, targetFile)
     updateMsg("New task added", 3)
-    writeTasks(targetFile)
     taskList(targetFile)
 
 
 # remove items from the todo.txt file
 def removeTask(n):
-    global tasks
-    # if removeTask was called without any parameters, purge all done tasks
-    if len(n.split()) == 0:
-        targets = [t["id"] for t in tasks if t["done"]]
-    # otherwise move through the passed parameters
-    else:
-        targets = n.split()
-    for token in targets:
-        try:
-            check = int(token)
-        except ValueError:
-            updateMsg("Please use the id of the task", 0)
-            continue
-        match = next((t for t in tasks if t["id"] == check), None)
-        if match is None:
-            updateMsg("Unable to find task id " + str(check), 0)
-        elif not match["done"]:
-            updateMsg("Unable to remove unfinished tasks", 0)
-        else:
-            tasks.remove(match)
-    writeTasks(targetFile)
+    manager.remove_task(n, targetFile)
     updateMsg("Removed task", 2)
     taskList(targetFile)
 
 
 # toggle item's done state instead of directly removing it
 def doneToggle(n):
-    global tasks
-    global openTasks
-    for token in n.split():
-        try:
-            check = int(token)
-        except ValueError:
-            updateMsg("Please use the id of the task", 0)
-            continue
-        match = next((t for t in tasks if t["id"] == check), None)
-        if match is None:
-            updateMsg("Unable to find task id " + str(check), 0)
-        elif not match["done"]:
-            match["done"] = True
-            match["completed"] = today()
-            if openTasks > 0:
-                openTasks = openTasks - 1
-            updateMsg("Marked task as done", 4)
-        else:
-            match["done"] = False
-            match["completed"] = None
-            openTasks = openTasks + 1
-            updateMsg("Marked task as not done", 4)
-    writeTasks(targetFile)
+    manager.done_toggle(n, targetFile)
     taskList(targetFile)
 
 
 # read todo.txt file into memory and print to stdout as sorted groups
 def renderTasks(content):
-    global tasks
     global lvl
     global openTasks
     group = {}
@@ -389,10 +531,10 @@ def renderTasks(content):
     gval = ""
     glvl = 0
     task = 0
-    tasks = readTasks(content)
-    lvl = loadLvl()
+    manager.load(content)
+    lvl = backend.load_lvl(content)
     # let's get things sorted
-    for o in tasks:
+    for o in manager.tasks:
         # if a due date exists, assign o to a group based on how far away it is
         if o["due"]:
             days = (date.fromisoformat(o["due"]) - date.today()).days
@@ -505,7 +647,7 @@ def foresight(n):
         value = int(n)
         if value in range(1, 5):
             lvl = value
-            saveLvl(value)
+            backend.save_lvl(targetFile, value)
             updateMsg("Foresight set to " + str(value), 4)
         else:
             raise ValueError
@@ -537,7 +679,7 @@ def fileswitcher():
     fileline()
     print("   Open available file\n")
     i = 0
-    fileList = listFiles()
+    fileList = backend.list_files()
     for singleFile in fileList:
         i = i + 1
         idSpacing = (5 - len(str(i))) * " "
@@ -573,7 +715,7 @@ def fileRemover():
     fileline()
     print("   Select a file for removal\n")
     i = 0
-    deletionList = listFiles()
+    deletionList = backend.list_files()
     if fileName in deletionList:
         deletionList.remove(fileName)
     for singleFile in deletionList:
@@ -587,10 +729,7 @@ def fileRemover():
         try:
             deletionPath = targetDir + "/" + deletionList[int(deleteFile) -1]
             try:
-                os.remove(deletionPath)
-                # clean up the per-file settings sidecar as well
-                if isfile(confPath(deletionPath)):
-                    os.remove(confPath(deletionPath))
+                backend.delete(deletionPath)
                 updateMsg("File deleted", 2)
                 taskList(targetFile)
             except:
@@ -608,7 +747,6 @@ def fileRemover():
 def newfile(file):
     global targetFile
     global fileName
-    global tasks
     global lvl
     clearScreen()
     fileline()
@@ -617,7 +755,7 @@ def newfile(file):
         modeline(5)
         newFile = input(" > ").strip().split()[0]
         if len(newFile) > 0:
-            tasks = []
+            manager.tasks = []
             lvl = 4
             fileName = newFile + ".txt"
             targetFile = targetDir + "/" + fileName
@@ -626,7 +764,7 @@ def newfile(file):
             updateMsg("Please specify a filename", 0)
             taskList(targetFile)
     elif len(file) >= 1:
-        tasks = []
+        manager.tasks = []
         lvl = 4
         fileName = file.strip().split(" ")[0] + ".txt"
         targetFile = targetDir + "/" + fileName
