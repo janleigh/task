@@ -17,19 +17,19 @@ from sys import exit as byebye
 
 #set up terminal help text and argparse
 parser = argparse.ArgumentParser(description="""
-                                 Task is a todo list application that allows you
-                                 to quickly create task lists by typing them
-                                 without any additional frizz. Write anything
-                                 into the input field and see it added as a new
-                                 item on your list.\n
-                                 Task understands you. By using a natural suffix
-                                 like 'in 3 days' it will automatically create a
-                                 timestamp and sort the added task according to
-                                 it's due date.\n
-                                 Once a task is finished, you can use it's id
-                                 and delete it by typing ':d id' where 'id' is
-                                 the number displayed with the task.\n
-                                 """)
+                                    Task is a todo list application that allows you
+                                    to quickly create task lists by typing them
+                                    without any additional frizz. Write anything
+                                    into the input field and see it added as a new
+                                    item on your list.\n
+                                    Task understands you. By using a natural suffix
+                                    like 'in 3 days' it will automatically create a
+                                    timestamp and sort the added task according to
+                                    it's due date.\n
+                                    Once a task is finished, you can use it's id
+                                    and delete it by typing ':d id' where 'id' is
+                                    the number displayed with the task.\n
+                                    """)
 parser.add_argument("-f", "--file",
                     help="specify an alternative filename to use as default",
                     metavar="(NAME)")
@@ -73,61 +73,45 @@ class style:
     reverse = "\033[7m"
 
 
-# ---------------------------------------------------------------------------
-# Bridge Pattern: Implementation interface
-# ---------------------------------------------------------------------------
-
 class StorageBackend(ABC):
-    """Abstract interface for task persistence (the 'Implementation' in the
-    Bridge pattern).  Concrete backends handle low-level file I/O while the
-    TaskManager abstraction delegates all storage work here."""
-
     @abstractmethod
     def load(self, path):
-        """Read tasks from *path* and return a list of task dicts."""
+        """"""
 
     @abstractmethod
     def save(self, path, tasks):
-        """Persist a list of task dicts to *path* (crash-safe)."""
+        """"""
 
     @abstractmethod
     def create(self, path):
-        """Create a new, empty task file (and parent directories)."""
+        """"""
 
     @abstractmethod
     def delete(self, path):
-        """Delete the task file at *path* and its sidecar config."""
+        """"""
 
     @abstractmethod
     def list_files(self):
-        """Return a list of available task file names."""
+        """"""
 
     @abstractmethod
     def file_exists(self, path):
-        """Return True if the task file at *path* exists."""
+        """"""
 
     @abstractmethod
     def load_lvl(self, path):
-        """Read the foresight level for *path*, defaulting to 4."""
+        """"""
 
     @abstractmethod
     def save_lvl(self, path, value):
-        """Persist the foresight level for *path*."""
+        """"""
 
     @abstractmethod
     def migrate_json(self, json_path, txt_path):
-        """One-shot migration of a legacy json file into the native format."""
+        """"""
 
-
-# ---------------------------------------------------------------------------
-# Bridge Pattern: Concrete Implementation — todo.txt backend
-# ---------------------------------------------------------------------------
 
 class TodoTxtBackend(StorageBackend):
-    """Concrete storage backend that persists tasks as todo.txt files.
-    Writes are crash-safe: data is flushed to a temporary file first, then
-    atomically moved into place via os.replace()."""
-
     def __init__(self, target_dir):
         self._target_dir = target_dir
 
@@ -149,7 +133,7 @@ class TodoTxtBackend(StorageBackend):
     def _line_to_task(line):
         """Parse a single todo.txt line into a task dict."""
         t = {"done": False, "completed": None, "priority": None,
-             "created": None, "due": None, "task": ""}
+            "created": None, "due": None, "task": ""}
         tokens = line.split(" ")
         i = 0
         # completion marker and optional completion date
@@ -275,8 +259,8 @@ class TodoTxtBackend(StorageBackend):
         migrated = []
         for o in old.get("tasks", []):
             t = {"done": str(o.get("done")) == "true", "completed": None,
-                 "priority": None, "created": None, "due": None,
-                 "task": str(o.get("task", ""))}
+                "priority": None, "created": None, "due": None,
+                "task": str(o.get("task", ""))}
             # the old format stored the due date as a unix timestamp
             if "due" in o:
                 try:
@@ -294,15 +278,7 @@ class TodoTxtBackend(StorageBackend):
         return migrated
 
 
-# ---------------------------------------------------------------------------
-# Bridge Pattern: Abstraction — task manager
-# ---------------------------------------------------------------------------
-
 class TaskManager:
-    """High-level task operations (the 'Abstraction' in the Bridge pattern).
-    Delegates all persistence work to a StorageBackend implementation via the
-    bridge reference self.backend."""
-
     def __init__(self, backend):
         self.backend = backend
         self.tasks = []
@@ -319,7 +295,7 @@ class TaskManager:
     def add_task(self, text, path):
         """Add a new task with optional natural 'in X days' due date."""
         t = {"done": False, "completed": None, "priority": None,
-             "created": today(), "due": None, "task": text}
+            "created": today(), "due": None, "task": text}
         # if a natural 'in X days' suffix is present, convert it to a due: tag
         # and strip it from the description
         dueTime = re.search(r'(in\s+(\d+?)\s+day(s\b|\b))$', text, re.M | re.I)
@@ -386,16 +362,12 @@ class TaskManager:
         self.save(path)
 
 
-# ---------------------------------------------------------------------------
-# Instantiate the bridge: concrete backend + task manager
-# ---------------------------------------------------------------------------
-
 backend = TodoTxtBackend(targetDir)
 manager = TaskManager(backend)
 
 
 # ---------------------------------------------------------------------------
-# UI helpers (unchanged from original, except using manager/backend)
+# UI helpers
 # ---------------------------------------------------------------------------
 
 # creates a strikethrough effect on fonts that support it
@@ -432,11 +404,11 @@ def updateMsg(msgBody, msgType):
 # set different mode
 def mode(m):
     modes = [color.white + " NORMAL ",
-             color.yellow + " HELP ",
-             color.red + " DELETION ",
-             color.yellow + " FORESIGHT ",
-             color.yellow + " OPEN FILE ",
-             color.yellow + " NEW FILE "]
+            color.yellow + " HELP ",
+            color.red + " DELETION ",
+            color.yellow + " FORESIGHT ",
+            color.yellow + " OPEN FILE ",
+            color.yellow + " NEW FILE "]
     return modes[m]
 
 
@@ -446,11 +418,11 @@ def modeline(v):
     size = os.popen('stty size', 'r').read().split()
     escLength = 15
     actions = [":h Help | :o Open | :d Done | :p Purge | :r Remove",
-               "enter Go Back",
-               "enter Go Back | id Remove File",
-               "enter Go Back | value Set Foresight",
-               "enter Go Back | id Open File",
-               "enter Go Back | name Create New File"]
+                "enter Go Back",
+                "enter Go Back | id Remove File",
+                "enter Go Back | value Set Foresight",
+                "enter Go Back | id Open File",
+                "enter Go Back | name Create New File"]
     left = mode(v) + color.white + " " + actions[v] + " "
     right = " #" + str(openTasks) + " ~" + str(lvl) + " " + message
     # calculate padding and account for escape sequence color codes
@@ -475,7 +447,7 @@ def fileline():
 
 
 # ---------------------------------------------------------------------------
-# Core application routines (using manager/backend bridge)
+# Core application routines
 # ---------------------------------------------------------------------------
 
 # check if the task file exists, execute creation if not
@@ -656,10 +628,10 @@ def foresight(n):
         fileline()
         print("""   Change amount of tasks to display
 
-   1    tasks due today and tomorrow
-   2    same as 1 plus unscheduled
-   3    same as 2 plus overdue
-   4    same as 3 plus tasks due days after
+    1    tasks due today and tomorrow
+    2    same as 1 plus unscheduled
+    3    same as 2 plus overdue
+    4    same as 3 plus tasks due days after
 """)
         modeline(3)
         foresightSelect = input(" > ").strip()
@@ -777,14 +749,14 @@ def userHelp():
     fileline()
     print("""   Available commands are
 
-   :d (id ...)   Mark a task id as done, seperate multiple tasks by space
-   :p (id ...)   Permanently remove a task, seperate multiple tasks by space
-   :f (1-4)      Viewing level of tasks, type :f to see further explanation
-   :o            Open another existing file
-   :n (name)     Creates a new file or opens existing one if filename exists
-   :r            Remove a file from disk
-   :help, :?     View this screen
-   :quit, :exit  exit the application
+    :d (id ...)   Mark a task id as done, seperate multiple tasks by space
+    :p (id ...)   Permanently remove a task, seperate multiple tasks by space
+    :f (1-4)      Viewing level of tasks, type :f to see further explanation
+    :o            Open another existing file
+    :n (name)     Creates a new file or opens existing one if filename exists
+    :r            Remove a file from disk
+    :help, :?     View this screen
+    :quit, :exit  exit the application
 """)
     modeline(1)
     input(" > Press return to go back...")
